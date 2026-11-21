@@ -1,0 +1,7 @@
+data/
+*.log
+bin/
+godis-server
+godis-bench
+.env
+.DS_Store

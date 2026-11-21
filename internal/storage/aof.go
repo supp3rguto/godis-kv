@@ -2,8 +2,9 @@ package storage
 
 import (
 	"bufio"
-	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -14,6 +15,11 @@ type AOF struct {
 }
 
 func NewAOF(path string) (*AOF, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
 	if err != nil {
 		return nil, err
@@ -21,7 +27,6 @@ func NewAOF(path string) (*AOF, error) {
 	return &AOF{file: file}, nil
 }
 
-// grava o comando no arquivo
 func (aof *AOF) Append(command string) error {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
@@ -29,31 +34,49 @@ func (aof *AOF) Append(command string) error {
 	return err
 }
 
-// replay - tpio, lê o arquivo no boot do servidor e recria o estado da memória
 func (aof *AOF) Replay(db *DB) error {
-	aof.file.Seek(0, 0)
-	scanner := bufio.NewScanner(aof.file)
+	aof.mu.Lock()
+	defer aof.mu.Unlock()
 
+	if _, err := aof.file.Seek(0, 0); err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(aof.file)
 	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.SplitN(line, " ", 4)
-		if len(parts) == 0 {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
-		
-		cmd := strings.ToUpper(parts[0])
-		if cmd == "SET" && len(parts) == 3 {
-			db.Set(parts[1], parts[2], 0)
-		} else if cmd == "SETEX" && len(parts) == 4 {
-			ttl, _ := strconv.Atoi(parts[2])
-			db.Set(parts[1], parts[3], ttl)
-		} else if cmd == "DEL" && len(parts) == 2 {
-			db.Delete(parts[1])
+
+		cmdParts := strings.SplitN(line, " ", 2)
+		cmd := strings.ToUpper(cmdParts[0])
+
+		switch cmd {
+		case "SET":
+			parts := strings.SplitN(line, " ", 3)
+			if len(parts) == 3 {
+				db.Set(parts[1], parts[2], 0)
+			}
+		case "SETEX":
+			parts := strings.SplitN(line, " ", 4)
+			if len(parts) == 4 {
+				if ttl, err := strconv.Atoi(parts[2]); err == nil {
+					db.Set(parts[1], parts[3], ttl)
+				}
+			}
+		case "DEL":
+			parts := strings.SplitN(line, " ", 2)
+			if len(parts) == 2 {
+				db.Delete(strings.TrimSpace(parts[1]))
+			}
 		}
 	}
 	return scanner.Err()
 }
 
 func (aof *AOF) Close() error {
+	aof.mu.Lock()
+	defer aof.mu.Unlock()
 	return aof.file.Close()
 }
