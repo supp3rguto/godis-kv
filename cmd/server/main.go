@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -12,35 +13,37 @@ import (
 )
 
 func main() {
-	aof, err := storage.NewAOF("data/database.log")
+	addr := flag.String("addr", ":6379", "Endereço e porta do servidor TCP")
+	aofPath := flag.String("aof", "data/database.log", "Caminho do arquivo AOF de persistência")
+	flag.Parse()
+
+	aof, err := storage.NewAOF(*aofPath)
 	if err != nil {
 		log.Fatalf("Erro ao iniciar AOF: %v", err)
 	}
 
 	db := storage.NewDB()
-	fmt.Println("Carregando dados do disco...")
-	aof.Replay(db)
+	fmt.Printf("Carregando dados de %s...\n", *aofPath)
+	if err := aof.Replay(db); err != nil {
+		log.Fatalf("Erro ao carregar dados do AOF: %v", err)
+	}
 
-	srv := server.NewServer(":6379", db, aof)
+	srv := server.NewServer(*addr, db, aof)
 
-	// roda o servidor em uma Goroutine separada para não travar a thread principal
 	go func() {
 		if err := srv.Start(); err != nil {
 			log.Fatalf("Erro no servidor: %v", err)
 		}
 	}()
 
-	// cria um canal que escuta por sinais de interrupção do s.o. (ctrl c kill)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	// A execução trava aqui até que um sinal chegue no canal 'stop'
 	<-stop
 
 	fmt.Println("\nSinal recebido. Iniciando desligamento gracioso...")
-	
-	srv.Stop() // fecha porta TCP e em baixo salva e fecha o arquivo de log no disco com segurança
-	aof.Close()
-	
+	srv.Stop()
+	if err := aof.Close(); err != nil {
+		log.Printf("Erro ao fechar AOF: %v", err)
+	}
 	fmt.Println("Conexões fechadas e disco sincronizado. Adeus!")
 }

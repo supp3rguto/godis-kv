@@ -2,23 +2,37 @@ package server
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"strings"
-
-	"github.com/supp3rguto/godis-kv/internal/storage"
 )
+
+type KeyValueStore interface {
+	Set(key, value string, ttlSeconds int)
+	Get(key string) (string, bool)
+	Delete(key string) bool
+}
+
+type AppendLogger interface {
+	Append(command string) error
+}
 
 type Server struct {
 	addr     string
-	db       *storage.DB
-	aof      *storage.AOF
+	db       KeyValueStore
+	aof      AppendLogger
 	listener net.Listener
 }
 
-func NewServer(addr string, db *storage.DB, aof *storage.AOF) *Server {
-	return &Server{addr: addr, db: db, aof: aof}
+func NewServer(addr string, db KeyValueStore, aof AppendLogger) *Server {
+	return &Server{
+		addr: addr,
+		db:   db,
+		aof:  aof,
+	}
 }
 
 func (s *Server) Start() error {
@@ -28,15 +42,15 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	fmt.Printf("Servidor TCP rodando na porta %s\n", s.addr)
+	fmt.Printf("Servidor TCP rodando em %s\n", s.addr)
 
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			// Se o erro for de fechamento do listener (Graceful Shutdown), apenas sai do loop
-			if strings.Contains(err.Error(), "use of closed network connection") {
+			if errors.Is(err, net.ErrClosed) {
 				break
 			}
+			log.Printf("Erro ao aceitar conexão: %v", err)
 			continue
 		}
 		go s.handleConnection(conn)
@@ -44,7 +58,6 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Função para ajudar no desligamento elegante
 func (s *Server) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
@@ -56,45 +69,47 @@ func (s *Server) handleConnection(conn net.Conn) {
 	scanner := bufio.NewScanner(conn)
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		// Permite dividir em até 4 partes para suportar SETEX chave seg valor
-		parts := strings.SplitN(strings.TrimSpace(line), " ", 4)
-		if len(parts) == 0 || parts[0] == "" {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
 
-		command := strings.ToUpper(parts[0])
+		cmdParts := strings.SplitN(line, " ", 2)
+		command := strings.ToUpper(cmdParts[0])
 
 		switch command {
 		case "SET":
+			parts := strings.SplitN(line, " ", 3)
 			if len(parts) < 3 {
 				conn.Write([]byte("ERR Sintaxe: SET <chave> <valor>\n"))
 				continue
 			}
-			s.db.Set(parts[1], parts[2], 0) // 0 TTL = permanente
-			s.aof.Append(line)
+			s.db.Set(parts[1], parts[2], 0)
+			s.logCommand(line)
 			conn.Write([]byte("OK\n"))
 
 		case "SETEX":
+			parts := strings.SplitN(line, " ", 4)
 			if len(parts) < 4 {
 				conn.Write([]byte("ERR Sintaxe: SETEX <chave> <segundos> <valor>\n"))
 				continue
 			}
 			ttl, err := strconv.Atoi(parts[2])
-			if err != nil {
+			if err != nil || ttl <= 0 {
 				conn.Write([]byte("ERR Segundos invalidos\n"))
 				continue
 			}
 			s.db.Set(parts[1], parts[3], ttl)
-			s.aof.Append(line)
+			s.logCommand(line)
 			conn.Write([]byte("OK\n"))
 
 		case "GET":
+			parts := strings.SplitN(line, " ", 2)
 			if len(parts) < 2 {
 				conn.Write([]byte("ERR Sintaxe: GET <chave>\n"))
 				continue
 			}
-			val, exists := s.db.Get(parts[1])
+			val, exists := s.db.Get(strings.TrimSpace(parts[1]))
 			if !exists {
 				conn.Write([]byte("(nil)\n"))
 			} else {
@@ -102,13 +117,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 
 		case "DEL":
+			parts := strings.SplitN(line, " ", 2)
 			if len(parts) < 2 {
 				conn.Write([]byte("ERR Sintaxe: DEL <chave>\n"))
 				continue
 			}
-			deleted := s.db.Delete(parts[1])
+			deleted := s.db.Delete(strings.TrimSpace(parts[1]))
 			if deleted {
-				s.aof.Append(line)
+				s.logCommand(line)
 				conn.Write([]byte("1\n"))
 			} else {
 				conn.Write([]byte("0\n"))
@@ -117,5 +133,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 		default:
 			conn.Write([]byte("ERR Comando desconhecido\n"))
 		}
+	}
+}
+
+func (s *Server) logCommand(line string) {
+	if s.aof == nil {
+		return
+	}
+	if err := s.aof.Append(line); err != nil {
+		log.Printf("Erro ao persistir comando no AOF: %v", err)
 	}
 }
