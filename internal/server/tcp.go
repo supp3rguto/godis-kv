@@ -8,23 +8,29 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
+// KeyValueStore define o contrato de armazenamento em memória consumido pelo servidor.
 type KeyValueStore interface {
 	Set(key, value string, ttlSeconds int)
 	Get(key string) (string, bool)
 	Delete(key string) bool
+	SnapshotCommands() []string
 }
 
+// AppendLogger define o contrato de persistência de comandos em disco.
 type AppendLogger interface {
 	Append(command string) error
+	Rewrite(snapshotFn func() []string) error
 }
 
 type Server struct {
-	addr     string
-	db       KeyValueStore
-	aof      AppendLogger
-	listener net.Listener
+	addr      string
+	db        KeyValueStore
+	aof       AppendLogger
+	listener  net.Listener
+	rewriting atomic.Bool
 }
 
 func NewServer(addr string, db KeyValueStore, aof AppendLogger) *Server {
@@ -129,6 +135,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 			} else {
 				conn.Write([]byte("0\n"))
 			}
+
+		case "BGREWRITEAOF":
+			if s.aof == nil {
+				conn.Write([]byte("ERR AOF nao configurado\n"))
+				continue
+			}
+			if !s.rewriting.CompareAndSwap(false, true) {
+				conn.Write([]byte("ERR Rewrite ja em andamento\n"))
+				continue
+			}
+			go func() {
+				defer s.rewriting.Store(false)
+				if err := s.aof.Rewrite(s.db.SnapshotCommands); err != nil {
+					log.Printf("Erro no BGREWRITEAOF: %v", err)
+				}
+			}()
+			conn.Write([]byte("Background append only file rewriting started\n"))
 
 		default:
 			conn.Write([]byte("ERR Comando desconhecido\n"))

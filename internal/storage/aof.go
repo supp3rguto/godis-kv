@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,8 +11,10 @@ import (
 )
 
 type AOF struct {
-	file *os.File
-	mu   sync.Mutex
+	path   string
+	file   *os.File
+	closed bool
+	mu     sync.Mutex
 }
 
 func NewAOF(path string) (*AOF, error) {
@@ -24,19 +27,97 @@ func NewAOF(path string) (*AOF, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &AOF{file: file}, nil
+	return &AOF{path: path, file: file}, nil
 }
 
 func (aof *AOF) Append(command string) error {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
+
+	if aof.closed {
+		return errors.New("aof fechado")
+	}
+
 	_, err := aof.file.WriteString(command + "\n")
 	return err
+}
+
+// Rewrite compacta o log em um arquivo temporário e faz substituição atômica via os.Rename.
+func (aof *AOF) Rewrite(snapshotFn func() []string) error {
+	aof.mu.Lock()
+	defer aof.mu.Unlock()
+
+	if aof.closed {
+		return errors.New("aof fechado")
+	}
+
+	commands := snapshotFn()
+	tmpPath := aof.path + ".tmp"
+
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+
+	writer := bufio.NewWriter(tmpFile)
+	for _, cmd := range commands {
+		if _, err := writer.WriteString(cmd + "\n"); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := aof.file.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := os.Rename(tmpPath, aof.path); err != nil {
+		os.Remove(tmpPath)
+		// Tenta reabrir o arquivo original para não deixar o ponteiro fechado
+		if reopened, reopenErr := os.OpenFile(aof.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666); reopenErr == nil {
+			aof.file = reopened
+		} else {
+			aof.closed = true
+		}
+		return err
+	}
+
+	newFile, err := os.OpenFile(aof.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	if err != nil {
+		aof.closed = true
+		return err
+	}
+
+	aof.file = newFile
+	return nil
 }
 
 func (aof *AOF) Replay(db *DB) error {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
+
+	if aof.closed {
+		return errors.New("aof fechado")
+	}
 
 	if _, err := aof.file.Seek(0, 0); err != nil {
 		return err
@@ -78,5 +159,10 @@ func (aof *AOF) Replay(db *DB) error {
 func (aof *AOF) Close() error {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
+
+	if aof.closed {
+		return nil
+	}
+	aof.closed = true
 	return aof.file.Close()
 }

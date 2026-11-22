@@ -2,10 +2,12 @@ package server
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type mockStore struct {
@@ -45,15 +47,35 @@ func (m *mockStore) Delete(key string) bool {
 	return false
 }
 
+func (m *mockStore) SnapshotCommands() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cmds := make([]string, 0, len(m.data))
+	for k, v := range m.data {
+		cmds = append(cmds, fmt.Sprintf("SET %s %s", k, v))
+	}
+	return cmds
+}
+
 type mockAOF struct {
-	mu       sync.Mutex
-	commands []string
+	mu            sync.Mutex
+	commands      []string
+	rewriteCalled chan []string
 }
 
 func (m *mockAOF) Append(command string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.commands = append(m.commands, command)
+	return nil
+}
+
+func (m *mockAOF) Rewrite(snapshotFn func() []string) error {
+	cmds := snapshotFn()
+	if m.rewriteCalled != nil {
+		m.rewriteCalled <- cmds
+	}
 	return nil
 }
 
@@ -109,11 +131,9 @@ func TestServer_ProtocolCommands(t *testing.T) {
 		}
 	}
 
-	// encerra conexao do cliente e aguarda handler finalizar para evitar race nas assercoes
 	clientConn.Close()
 	<-done
 
-	// valida que apenas comandos de escrita efetivos foram enviados ao AOF
 	expectedAOF := []string{
 		"SET user guto",
 		"SET frase ola mundo",
@@ -130,8 +150,47 @@ func TestServer_ProtocolCommands(t *testing.T) {
 		}
 	}
 
-	// valida que o TTL do SETEX foi repassado corretamente ao storage
 	if gotTTL := store.ttls["cache"]; gotTTL != 30 {
 		t.Errorf("TTL da chave 'cache': esperado 30, recebido %d", gotTTL)
 	}
+}
+
+func TestServer_BGRewriteAOF(t *testing.T) {
+	store := newMockStore()
+	aof := &mockAOF{rewriteCalled: make(chan []string, 1)}
+	srv := NewServer(":0", store, aof)
+
+	clientConn, serverConn := net.Pipe()
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		srv.handleConnection(serverConn)
+	}()
+
+	reader := bufio.NewReader(clientConn)
+
+	_, _ = clientConn.Write([]byte("SET chave1 valor1\n"))
+	_, _ = reader.ReadString('\n')
+
+	_, _ = clientConn.Write([]byte("BGREWRITEAOF\n"))
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("erro ao ler resposta do BGREWRITEAOF: %v", err)
+	}
+	if strings.TrimSpace(resp) != "Background append only file rewriting started" {
+		t.Fatalf("resposta inesperada: %q", resp)
+	}
+
+	select {
+	case cmds := <-aof.rewriteCalled:
+		if len(cmds) != 1 || cmds[0] != "SET chave1 valor1" {
+			t.Errorf("snapshot inesperado no rewrite: %v", cmds)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout aguardando execucao do BGREWRITEAOF em background")
+	}
+
+	clientConn.Close()
+	<-done
 }
