@@ -22,7 +22,7 @@ func main() {
 	for i := 0; i < numClients; i++ {
 		wg.Add(1)
 		
-		// Inicia uma Goroutine para cada cliente
+		// começa uma Goroutine para cada cliente
 		go func(id int) {
 			defer wg.Done()
 
