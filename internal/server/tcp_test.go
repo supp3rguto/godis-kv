@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/supp3rguto/godis-kv/internal/pubsub"
 )
 
 type mockStore struct {
@@ -82,7 +84,7 @@ func (m *mockAOF) Rewrite(snapshotFn func() []string) error {
 func TestServer_ProtocolCommands(t *testing.T) {
 	store := newMockStore()
 	aof := &mockAOF{}
-	srv := NewServer(":0", store, aof)
+	srv := NewServer(":0", store, aof, nil)
 
 	clientConn, serverConn := net.Pipe()
 	done := make(chan struct{})
@@ -158,7 +160,7 @@ func TestServer_ProtocolCommands(t *testing.T) {
 func TestServer_BGRewriteAOF(t *testing.T) {
 	store := newMockStore()
 	aof := &mockAOF{rewriteCalled: make(chan []string, 1)}
-	srv := NewServer(":0", store, aof)
+	srv := NewServer(":0", store, aof, nil)
 
 	clientConn, serverConn := net.Pipe()
 	done := make(chan struct{})
@@ -193,4 +195,90 @@ func TestServer_BGRewriteAOF(t *testing.T) {
 
 	clientConn.Close()
 	<-done
+}
+
+func TestServer_PubSub(t *testing.T) {
+	store := newMockStore()
+	broker := pubsub.NewBroker()
+	srv := NewServer(":0", store, nil, broker)
+
+	subClient, subServer := net.Pipe()
+	pubClient, pubServer := net.Pipe()
+
+	subDone := make(chan struct{})
+	pubDone := make(chan struct{})
+
+	go func() {
+		defer close(subDone)
+		srv.handleConnection(subServer)
+	}()
+	go func() {
+		defer close(pubDone)
+		srv.handleConnection(pubServer)
+	}()
+
+	subReader := bufio.NewReader(subClient)
+	pubReader := bufio.NewReader(pubClient)
+
+	// 1- cliente 1 se inscreve no canal 'alertas'
+	if _, err := subClient.Write([]byte("SUBSCRIBE alertas\n")); err != nil {
+		t.Fatalf("erro ao enviar SUBSCRIBE: %v", err)
+	}
+	resp, err := subReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("erro ao ler resposta do SUBSCRIBE: %v", err)
+	}
+	if strings.TrimSpace(resp) != "SUBSCRIBED alertas" {
+		t.Fatalf("esperava 'SUBSCRIBED alertas', recebeu %q", resp)
+	}
+
+	// 2- cliente 2 publica mensagem no canal 'alertas'
+	if _, err := pubClient.Write([]byte("PUBLISH alertas servidor online\n")); err != nil {
+		t.Fatalf("erro ao enviar PUBLISH: %v", err)
+	}
+	pubResp, err := pubReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("erro ao ler resposta do PUBLISH: %v", err)
+	}
+	if strings.TrimSpace(pubResp) != "1" {
+		t.Fatalf("esperava '1' entrega, recebeu %q", pubResp)
+	}
+
+	// 3- cliente 1 recebe a mensagem em tempo real
+	msg, err := subReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("erro ao ler mensagem publicada: %v", err)
+	}
+	if strings.TrimSpace(msg) != "MESSAGE alertas servidor online" {
+		t.Fatalf("esperava 'MESSAGE alertas servidor online', recebeu %q", msg)
+	}
+
+	// 4- cliente 1 cancela inscricao
+	if _, err := subClient.Write([]byte("UNSUBSCRIBE alertas\n")); err != nil {
+		t.Fatalf("erro ao enviar UNSUBSCRIBE: %v", err)
+	}
+	unsubResp, err := subReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("erro ao ler resposta do UNSUBSCRIBE: %v", err)
+	}
+	if strings.TrimSpace(unsubResp) != "UNSUBSCRIBED alertas" {
+		t.Fatalf("esperava 'UNSUBSCRIBED alertas', recebeu %q", unsubResp)
+	}
+
+	// 5- nova publicacao q n deve atingir mais nenhum assinante
+	if _, err := pubClient.Write([]byte("PUBLISH alertas ninguem ouvindo\n")); err != nil {
+		t.Fatalf("erro ao enviar segundo PUBLISH: %v", err)
+	}
+	pubResp, err = pubReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("erro ao ler resposta do segundo PUBLISH: %v", err)
+	}
+	if strings.TrimSpace(pubResp) != "0" {
+		t.Fatalf("esperava '0' entregas apos unsubscribe, recebeu %q", pubResp)
+	}
+
+	subClient.Close()
+	pubClient.Close()
+	<-subDone
+	<-pubDone
 }

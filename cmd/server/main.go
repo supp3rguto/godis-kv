@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/supp3rguto/godis-kv/internal/pubsub"
 	"github.com/supp3rguto/godis-kv/internal/server"
 	"github.com/supp3rguto/godis-kv/internal/storage"
 )
@@ -28,7 +29,8 @@ func main() {
 		log.Fatalf("Erro ao carregar dados do AOF: %v", err)
 	}
 
-	srv := server.NewServer(*addr, db, aof)
+	broker := pubsub.NewBroker()
+	srv := server.NewServer(*addr, db, aof, broker)
 
 	go func() {
 		if err := srv.Start(); err != nil {
