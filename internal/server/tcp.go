@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 )
 
-// define o contrato de armazenamento em memória consumido pelo servidor
+//  defines the in-memory storage contract consumed by the server
 type KeyValueStore interface {
 	Set(key, value string, ttlSeconds int)
 	Get(key string) (string, bool)
@@ -20,13 +20,13 @@ type KeyValueStore interface {
 	SnapshotCommands() []string
 }
 
-//define o contrato de persistência de comandos em disco
+//  defines the disk persistence contract
 type AppendLogger interface {
 	Append(command string) error
 	Rewrite(snapshotFn func() []string) error
 }
 
-// define o contrato de mensageria em tempo real
+// defines the real-time messaging contract
 type PubSubBroker interface {
 	Subscribe(channel string) (<-chan string, func())
 	Publish(channel, message string) int
@@ -57,7 +57,7 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	fmt.Printf("Servidor TCP rodando em %s\n", s.addr)
+	fmt.Printf("TCP server listening on %s\n", s.addr)
 
 	for {
 		conn, err := s.listener.Accept()
@@ -65,7 +65,7 @@ func (s *Server) Start() error {
 			if errors.Is(err, net.ErrClosed) {
 				break
 			}
-			log.Printf("Erro ao aceitar conexão: %v", err)
+			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
 		go s.handleConnection(conn)
@@ -86,10 +86,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 		subs    = make(map[string]func())
 	)
 
-	// ordem LIFO no encerramento:
-	// 1-cancela inscricoes (fecha os go channels)
-	// 2-fecha o socket tcp (desbloqueia qualquer escrita pendente)
-	// 3-aguarda todas as goroutines de entrega finalizarem
 	defer wg.Wait()
 	defer conn.Close()
 	defer func() {
@@ -119,7 +115,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		case "SET":
 			parts := strings.SplitN(line, " ", 3)
 			if len(parts) < 3 {
-				writeLine("ERR Sintaxe: SET <chave> <valor>")
+				writeLine("ERR syntax: SET <key> <value>")
 				continue
 			}
 			s.db.Set(parts[1], parts[2], 0)
@@ -129,12 +125,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 		case "SETEX":
 			parts := strings.SplitN(line, " ", 4)
 			if len(parts) < 4 {
-				writeLine("ERR Sintaxe: SETEX <chave> <segundos> <valor>")
+				writeLine("ERR syntax: SETEX <key> <seconds> <value>")
 				continue
 			}
 			ttl, err := strconv.Atoi(parts[2])
 			if err != nil || ttl <= 0 {
-				writeLine("ERR Segundos invalidos")
+				writeLine("ERR invalid seconds")
 				continue
 			}
 			s.db.Set(parts[1], parts[3], ttl)
@@ -144,7 +140,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		case "GET":
 			parts := strings.SplitN(line, " ", 2)
 			if len(parts) < 2 {
-				writeLine("ERR Sintaxe: GET <chave>")
+				writeLine("ERR syntax: GET <key>")
 				continue
 			}
 			val, exists := s.db.Get(strings.TrimSpace(parts[1]))
@@ -157,7 +153,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		case "DEL":
 			parts := strings.SplitN(line, " ", 2)
 			if len(parts) < 2 {
-				writeLine("ERR Sintaxe: DEL <chave>")
+				writeLine("ERR syntax: DEL <key>")
 				continue
 			}
 			deleted := s.db.Delete(strings.TrimSpace(parts[1]))
@@ -170,29 +166,29 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		case "BGREWRITEAOF":
 			if s.aof == nil {
-				writeLine("ERR AOF nao configurado")
+				writeLine("ERR AOF not configured")
 				continue
 			}
 			if !s.rewriting.CompareAndSwap(false, true) {
-				writeLine("ERR Rewrite ja em andamento")
+				writeLine("ERR rewrite already in progress")
 				continue
 			}
 			go func() {
 				defer s.rewriting.Store(false)
 				if err := s.aof.Rewrite(s.db.SnapshotCommands); err != nil {
-					log.Printf("Erro no BGREWRITEAOF: %v", err)
+					log.Printf("BGREWRITEAOF error: %v", err)
 				}
 			}()
 			writeLine("Background append only file rewriting started")
 
 		case "SUBSCRIBE":
 			if s.pubsub == nil {
-				writeLine("ERR Pub/Sub nao configurado")
+				writeLine("ERR Pub/Sub not configured")
 				continue
 			}
 			parts := strings.SplitN(line, " ", 2)
 			if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-				writeLine("ERR Sintaxe: SUBSCRIBE <canal>")
+				writeLine("ERR syntax: SUBSCRIBE <channel>")
 				continue
 			}
 			channel := strings.TrimSpace(parts[1])
@@ -211,12 +207,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		case "UNSUBSCRIBE":
 			if s.pubsub == nil {
-				writeLine("ERR Pub/Sub nao configurado")
+				writeLine("ERR Pub/Sub not configured")
 				continue
 			}
 			parts := strings.SplitN(line, " ", 2)
 			if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-				writeLine("ERR Sintaxe: UNSUBSCRIBE <canal>")
+				writeLine("ERR syntax: UNSUBSCRIBE <channel>")
 				continue
 			}
 			channel := strings.TrimSpace(parts[1])
@@ -228,19 +224,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		case "PUBLISH":
 			if s.pubsub == nil {
-				writeLine("ERR Pub/Sub nao configurado")
+				writeLine("ERR Pub/Sub not configured")
 				continue
 			}
 			parts := strings.SplitN(line, " ", 3)
 			if len(parts) < 3 {
-				writeLine("ERR Sintaxe: PUBLISH <canal> <mensagem>")
+				writeLine("ERR syntax: PUBLISH <channel> <message>")
 				continue
 			}
 			count := s.pubsub.Publish(parts[1], parts[2])
 			writeLine(strconv.Itoa(count))
 
 		default:
-			writeLine("ERR Comando desconhecido")
+			writeLine("ERR unknown command")
 		}
 	}
 }
@@ -250,6 +246,6 @@ func (s *Server) logCommand(line string) {
 		return
 	}
 	if err := s.aof.Append(line); err != nil {
-		log.Printf("Erro ao persistir comando no AOF: %v", err)
+		log.Printf("Failed to append command to AOF: %v", err)
 	}
 }

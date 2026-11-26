@@ -14,19 +14,19 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":6379", "Endereço e porta do servidor TCP")
-	aofPath := flag.String("aof", "data/database.log", "Caminho do arquivo AOF de persistência")
+	addr := flag.String("addr", ":6379", "TCP server bind address and port")
+	aofPath := flag.String("aof", "data/database.log", "Path to the AOF persistence file")
 	flag.Parse()
 
 	aof, err := storage.NewAOF(*aofPath)
 	if err != nil {
-		log.Fatalf("Erro ao iniciar AOF: %v", err)
+		log.Fatalf("Failed to initialize AOF: %v", err)
 	}
 
 	db := storage.NewDB()
-	fmt.Printf("Carregando dados de %s...\n", *aofPath)
+	fmt.Printf("Loading data from %s...\n", *aofPath)
 	if err := aof.Replay(db); err != nil {
-		log.Fatalf("Erro ao carregar dados do AOF: %v", err)
+		log.Fatalf("Failed to replay AOF: %v", err)
 	}
 
 	broker := pubsub.NewBroker()
@@ -34,7 +34,7 @@ func main() {
 
 	go func() {
 		if err := srv.Start(); err != nil {
-			log.Fatalf("Erro no servidor: %v", err)
+			log.Fatalf("Server error: %v", err)
 		}
 	}()
 
@@ -42,10 +42,10 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	fmt.Println("\nSinal recebido. Iniciando desligamento gracioso...")
+	fmt.Println("\nShutdown signal received. Starting graceful shutdown...")
 	srv.Stop()
 	if err := aof.Close(); err != nil {
-		log.Printf("Erro ao fechar AOF: %v", err)
+		log.Printf("Failed to close AOF: %v", err)
 	}
-	fmt.Println("Conexões fechadas e disco sincronizado. Adeus!")
+	fmt.Println("Connections closed and disk synced. Goodbye!")
 }
