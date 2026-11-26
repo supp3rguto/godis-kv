@@ -1,0 +1,12 @@
+services:
+  godis:
+    build: .
+    container_name: godis-kv
+    ports:
+      - "6379:6379"
+    volumes:
+      - godis_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  godis_data:

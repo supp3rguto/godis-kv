@@ -5,3 +5,7 @@ godis-server
 godis-bench
 .env
 .DS_Store
+.git
+.gitignore
+data/
+README.md
