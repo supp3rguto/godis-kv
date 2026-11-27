@@ -1,169 +1,230 @@
 # godis-kv
 
-Banco de dados **Key-Value em memória** construído do zero em Go, operando sobre protocolo TCP puro e sem dependências externas.
+An in-memory **Key-Value database and Pub/Sub broker** built from scratch in Go, operating over raw TCP with zero external dependencies.
 
-A proposta do projeto é sair da camada de frameworks web de alto nível e descer para a "sala de máquinas" da computação — construindo um clone minimalista do Redis para armazenar sessões ou cache de alta velocidade, lidando diretamente com sockets TCP, concorrência segura em memória, persistência em disco e encerramento controlado de processos.
+The goal of this project is to step away from high-level web frameworks and work directly inside the "engine room" of systems programming — building a minimalist Redis-inspired server for high-speed caching, session storage, and real-time messaging while handling raw TCP sockets, thread-safe concurrency, disk persistence, atomic log compaction, and controlled process shutdown.
 
-## O que está sendo praticado
+## Core Engineering Concepts Practiced
 
-Mais do que implementar um mapa em memória, cada pacote do repositório exercita um fundamento central de engenharia de sistemas e Go idiomático:
+Beyond implementing an in-memory map, each package exercises a core systems engineering and idiomatic Go concept:
 
-- **Rede em baixo nível (`net` / TCP raw):** servidor TCP customizado escutando conexões brutas na porta `:6379` (configurável via CLI), sem HTTP ou frameworks web, com parser próprio de comandos de texto.
-- **Concorrência e Thread-Safety (`goroutines` + `sync.RWMutex`):** cada cliente conectado é atendido em sua própria goroutine; leituras simultâneas (`GET`) compartilham o lock de leitura (`RLock`), enquanto escritas e remoções (`SET`, `SETEX`, `DEL`) aplicam bloqueio exclusivo (`Lock`) para eliminar *race conditions*.
-- **Expiração de chaves (TTL):** suporte a chaves com tempo de vida útil combinando verificação passiva na leitura (`Get`) e uma rotina ativa em background (`time.NewTicker`) que remove chaves expiradas periodicamente da memória.
-- **Persistência simples via Append-Only File (AOF):** cada operação de mutação efetiva é gravada sequencialmente em disco (`data/database.log`). Ao reiniciar o servidor, o método `Replay` lê o arquivo e reconstrói o estado na memória.
-- **Desacoplamento por interfaces (Go idiomático):** o pacote `internal/server` define os contratos que consome (`KeyValueStore` e `AppendLogger`), sem importar `internal/storage` diretamente — permitindo injetar *mocks* e testar o protocolo sem tocar no disco.
-- **Graceful Shutdown:** interceptação dos sinais `SIGINT` (`Ctrl+C`) e `SIGTERM` via `os/signal` para encerrar o listener TCP, impedir novas conexões e fechar o arquivo AOF com segurança antes de finalizar o processo.
-- **Testes automatizados com Race Detector:** suíte de testes cobrindo CRUD, expiração real de TTL, estresse concorrente com 1.000 goroutines simultâneas, replay de AOF com `t.TempDir()` e protocolo TCP em memória com `net.Pipe()`.
+- **Raw TCP Networking (`net`):** Custom TCP server listening on `:6379` (configurable via CLI flags) with no HTTP layer or web frameworks, powered by a custom line-based command parser.
+- **Shared-Memory Concurrency (`goroutines` + `sync.RWMutex`):** Each client connection runs in its own goroutine. Concurrent reads (`GET`) share read locks (`RLock`), while mutations (`SET`, `SETEX`, `DEL`) acquire exclusive write locks (`Lock`) to eliminate race conditions.
+- **Key Expiration (TTL):** Support for expiring keys combining passive expiration checks on read (`Get`) with an active background cleanup loop (`time.NewTicker`) that periodically evicts expired entries.
+- **Append-Only File Persistence (AOF) & Atomic Compaction (`BGREWRITEAOF`):** Every effective write operation is appended sequentially to disk (`data/database.log`) and replayed on startup (`Replay`). Background compaction snapshots only live keys to a temporary file, calls `Sync()`, and replaces the log atomically via `os.Rename`, guarded by an `atomic.Bool` to prevent concurrent rewrites.
+- **Real-Time Pub/Sub with Go Channels (`SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`):** Dedicated in-memory broker using buffered Go channels and non-blocking `select` statements so slow subscribers never stall publishers, with `sync.Once` and `sync.WaitGroup` ensuring leak-free cleanup on client disconnect.
+- **Idiomatic Interface Decoupling:** Following Go's *"accept interfaces, return structs"* principle, `internal/server` defines the contracts it consumes (`KeyValueStore`, `AppendLogger`, and `PubSubBroker`) without importing `internal/storage` directly — enabling in-memory protocol testing with mocks and `net.Pipe()`.
+- **Graceful Shutdown:** Captures `SIGINT` and `SIGTERM` via `os/signal` to stop accepting new connections, close the TCP listener, and flush/close the AOF file cleanly before exiting.
+- **Automated Testing & Race Detection:** Unit and integration tests executed with `-race` covering CRUD, real TTL expiration, 1,000-goroutine stress tests, AOF replay and compaction (`t.TempDir()`), Pub/Sub concurrency, and full TCP protocol flows (`net.Pipe()`).
+- **Load Benchmarking & Containerization:** Built-in worker-pool benchmark tool measuring throughput (`req/s`) and latency percentiles (`Min`, `Avg`, `P50`, `P95`, `P99`, `Max`), paired with a `Makefile` and a multi-stage `Dockerfile` producing a minimal non-root Alpine image with persistent AOF volumes.
 
-## Stack e ferramentas
+## Tech Stack & Tools
 
-- Go `1.26` (**100% biblioteca padrão**, zero dependências de terceiros)
-- Pacotes nativos: `net`, `bufio`, `sync`, `os/signal`, `flag`, `testing`
+- Go `1.26` (**100% standard library**, zero third-party dependencies)
+- Standard packages: `net`, `bufio`, `sync`, `sync/atomic`, `os/signal`, `flag`, `slices`, `testing`
 - Go Race Detector (`go test -race`)
-- `netcat` (`nc`) para interação manual via TCP no terminal
+- GNU Make (`Makefile`)
+- Docker (multi-stage static build on `alpine:3.21`) & Docker Compose
+- `netcat` (`nc`) for manual TCP interaction
 
-## Estrutura do projeto
+## Project Structure
 
 ```text
 godis-kv/
+├── .dockerignore
 ├── .gitignore
+├── Dockerfile                      # Multi-stage build (static Linux binary + non-root Alpine runtime)
+├── docker-compose.yml              # Container orchestration with persistent named volume (godis_data)
+├── Makefile                        # Automation targets: build, run, test, bench, clean, docker-up/down
 ├── go.mod
 ├── cmd/
 │   ├── server/
-│   │   └── main.go                 # Ponto de entrada: flags CLI (-addr, -aof), replay do AOF e graceful shutdown
+│   │   └── main.go                 # Entrypoint: CLI flags (-addr, -aof), AOF replay, broker wiring, graceful shutdown
 │   └── bench/
-│       └── main.go                 # Script de carga disparando 10.000 requisições TCP concorrentes
+│       └── main.go                 # Worker-pool load generator with throughput and P50/P95/P99 latency metrics
 └── internal/
+    ├── pubsub/
+    │   ├── broker.go               # Thread-safe Pub/Sub broker using buffered Go channels and non-blocking select
+    │   └── broker_test.go          # Unit, slow-subscriber overflow, and concurrency tests
     ├── server/
-    │   ├── tcp.go                  # Servidor TCP raw, parser de comandos e interfaces KeyValueStore / AppendLogger
-    │   └── tcp_test.go             # Testes do protocolo TCP via net.Pipe() usando mocks em memória
+    │   ├── tcp.go                  # Raw TCP server, command parser, and consumer-side interfaces
+    │   └── tcp_test.go             # Protocol, BGREWRITEAOF, and multi-client Pub/Sub tests via net.Pipe()
     └── storage/
-        ├── db.go                   # Motor Key-Value em memória, sync.RWMutex e rotina de limpeza de TTL
-        ├── db_test.go              # Testes de CRUD, expiração de TTL e concorrência (1.000 workers)
-        ├── aof.go                  # Persistência Append-Only File (criação automática de diretório, Append e Replay)
-        └── aof_test.go             # Testes de escrita, reabertura e Replay com t.TempDir()
+        ├── db.go                   # In-memory KV engine, sync.RWMutex, TTL cleanup routine, and live snapshot generator
+        ├── db_test.go              # CRUD, TTL expiration, and 1,000-worker race condition tests
+        ├── aof.go                  # Append-Only File persistence (auto-mkdir, Append, Replay, atomic Rewrite)
+        └── aof_test.go             # Persistence, reopen/replay, and size-reduction compaction tests with t.TempDir()
 ```
 
-## Nota sobre arquitetura e persistência
+## Architecture & Persistence Notes
 
-O pacote `internal/server` foi estruturado seguindo a convenção de Go *"accept interfaces, return structs"*. Por definir `KeyValueStore` e `AppendLogger` no próprio pacote consumidor, o servidor TCP não conhece detalhes de implementação do mapa em memória nem do sistema de arquivos, o que possibilitou testar todo o protocolo com conexões em memória (`net.Pipe`) e validar exatamente quais comandos geram escrita no log.
+The `internal/server` package owns its dependency contracts (`KeyValueStore`, `AppendLogger`, and `PubSubBroker`). Because the TCP layer never depends on concrete storage or filesystem structs, the entire command protocol and background rewrite trigger can be tested deterministically in memory using `net.Pipe()` and lightweight mocks.
 
-Para evitar falhas de inicialização em clones limpos do repositório (já que o diretório `data/` e os arquivos `*.log` são ignorados no `.gitignore`), o construtor `storage.NewAOF` cria automaticamente os diretórios necessários via `os.MkdirAll` antes de abrir o arquivo. No estágio atual, o AOF opera apenas em modo append; a compactação periódica (`BGREWRITEAOF`) está mapeada nos próximos passos.
+For disk persistence, `storage.NewAOF` automatically creates parent directories via `os.MkdirAll`, preventing startup failures on fresh clones where `data/` is gitignored. During `BGREWRITEAOF`, `aof.Rewrite` receives a `snapshotFn` callback and executes it while holding the AOF mutex (respecting the `aof.mu -> db.mu` lock hierarchy), preventing both deadlocks and lost writes between snapshotting and the atomic `os.Rename` swap.
 
-## Como executar localmente
+## Running Locally
 
-### Pré-requisitos
+### Prerequisites
 
-- Go `1.22+` instalado (`go version`)
-- `netcat` (`netcat-openbsd` no Linux) para enviar comandos manuais via TCP
+- Go `1.22+` (`go version`)
+- `make` (optional, for shortcut commands)
+- `netcat` (`nc`) for manual TCP commands
+- Docker & Docker Compose (optional, for containerized execution)
 
-### Passo a passo
+### Option 1: Run with Go / Make
 
-1. Clone o repositório e acesse o diretório:
+1. Clone the repository:
 
 ```bash
-git clone https://github.com/supp3rguto/godis-kv.git
+git clone [https://github.com/supp3rguto/godis-kv.git](https://github.com/supp3rguto/godis-kv.git)
 cd godis-kv
 ```
 
-2. **Terminal 1** — suba o servidor TCP (porta padrão `:6379` e log em `data/database.log`):
+2. **Terminal 1** — start the TCP server (defaults to `:6379` and `data/database.log`):
 
 ```bash
-go run ./cmd/server
+make run
 ```
 
-Também é possível customizar porta e arquivo AOF via flags:
+Or customize address and AOF path via CLI flags:
 
 ```bash
 go run ./cmd/server -addr :6380 -aof data/custom.log
 ```
 
-Para compilar o binário executável:
+To compile stripped binaries into `bin/`:
 
 ```bash
-go build -o bin/godis-server ./cmd/server
+make build
 ./bin/godis-server -addr :6379 -aof data/database.log
 ```
 
-3. **Terminal 2** — conecte-se ao banco via TCP puro com `netcat`:
+3. **Terminal 2** — connect via raw TCP using `netcat`:
 
 ```bash
 nc localhost 6379
 ```
 
-### Rodando os testes e o detector de Race Conditions
+### Option 2: Run with Docker
 
-Execute toda a suíte com verificação de *race conditions* e relatório de cobertura:
-
-```bash
-go test -race -v -cover ./...
-```
-
-Cobertura atual dos pacotes internos:
-- `internal/storage`: `92.6%`
-- `internal/server`: `68.2%`
-
-### Rodando o benchmark de carga
-
-Com o servidor rodando no **Terminal 1** na porta `:6379`, dispare 10.000 requisições concorrentes (`SET` e `GET`) a partir de outro terminal:
+Build the multi-stage image and start the container with persistent AOF storage (`godis_data` volume):
 
 ```bash
-go run ./cmd/bench
+make docker-up
+docker logs godis-kv
 ```
 
-## Protocolo e comandos
+Stop and remove the container (persisted keys remain intact inside the Docker volume and are automatically replayed on the next start):
 
-| Comando | Sintaxe | Persistido no AOF | Respostas |
+```bash
+make docker-down
+```
+
+## Testing & Race Detection
+
+Run the full test suite with Go's race detector and coverage report:
+
+```bash
+make test
+```
+
+Current internal package coverage:
+- `internal/pubsub`: `100.0%`
+- `internal/storage`: `76.2%`
+- `internal/server`: `68.5%`
+
+## Benchmarking
+
+With the server running on `:6379`, execute the worker-pool benchmark tool:
+
+```bash
+# Default mixed workload (50 workers, 10,000 requests: 50% SET / 50% GET)
+make bench
+
+# Custom workloads
+go run ./cmd/bench -addr localhost:6379 -workers 50 -requests 10000 -mode mixed
+go run ./cmd/bench -addr localhost:6379 -workers 50 -requests 10000 -mode set
+go run ./cmd/bench -addr localhost:6379 -workers 50 -requests 10000 -mode get
+```
+
+Each worker maintains a persistent TCP connection and records latencies in a local slice without lock contention, sorting all samples at the end to compute exact `P50`, `P95`, and `P99` tail latencies.
+
+## Protocol & Commands
+
+| Command | Syntax | Persisted to AOF | Responses |
 | --- | --- | --- | --- |
-| `SET` | `SET <chave> <valor>` | Sim | `OK`, `ERR Sintaxe: SET <chave> <valor>` |
-| `SETEX` | `SETEX <chave> <segundos> <valor>` | Sim | `OK`, `ERR Segundos invalidos`, `ERR Sintaxe: SETEX <chave> <segundos> <valor>` |
-| `GET` | `GET <chave>` | Não | `<valor>`, `(nil)`, `ERR Sintaxe: GET <chave>` |
-| `DEL` | `DEL <chave>` | Sim (se existir) | `1` (removido), `0` (inexistente), `ERR Sintaxe: DEL <chave>` |
+| `SET` | `SET <key> <value>` | Yes | `OK`, `ERR syntax: SET <key> <value>` |
+| `SETEX` | `SETEX <key> <seconds> <value>` | Yes | `OK`, `ERR invalid seconds`, `ERR syntax: SETEX <key> <seconds> <value>` |
+| `GET` | `GET <key>` | No | `<value>`, `(nil)`, `ERR syntax: GET <key>` |
+| `DEL` | `DEL <key>` | Yes (if key existed) | `1` (deleted), `0` (not found), `ERR syntax: DEL <key>` |
+| `BGREWRITEAOF` | `BGREWRITEAOF` | Rewrites AOF | `Background append only file rewriting started`, `ERR rewrite already in progress`, `ERR AOF not configured` |
+| `SUBSCRIBE` | `SUBSCRIBE <channel>` | No | `SUBSCRIBED <channel>`, pushes `MESSAGE <channel> <message>` |
+| `UNSUBSCRIBE` | `UNSUBSCRIBE <channel>` | No | `UNSUBSCRIBED <channel>` |
+| `PUBLISH` | `PUBLISH <channel> <message>` | No | `<delivered_count>`, `ERR syntax: PUBLISH <channel> <message>` |
 
-Valores com espaços são suportados tanto no `SET` quanto no `SETEX`. Comandos não reconhecidos retornam `ERR Comando desconhecido`.
+Values and Pub/Sub messages containing spaces are supported. Unrecognized commands return `ERR unknown command`.
 
-### Exemplos via `netcat`
+### Examples via `netcat`
+
+**Key-Value, TTL & AOF Compaction:**
 
 ```text
 $ nc localhost 6379
-SET usuario guto
+SET user guto
 OK
-GET usuario
+GET user
 guto
-SET frase banco em memoria com go
+SET phrase in-memory database in go
 OK
-GET frase
-banco em memoria com go
-SETEX sessao 5 token_temporario
+GET phrase
+in-memory database in go
+SETEX session 5 temp_token
 OK
-GET sessao
-token_temporario
-# após 5 segundos:
-GET sessao
+GET session
+temp_token
+# after 5 seconds:
+GET session
 (nil)
-DEL usuario
+DEL user
 1
-GET usuario
-(nil)
+BGREWRITEAOF
+Background append only file rewriting started
 ```
 
-## Progresso e próximos passos
+**Real-Time Pub/Sub (two terminals):**
 
-- [x] Servidor TCP customizado com pacote `net` nativo e goroutine por conexão
-- [x] Engine Key-Value em memória protegida com `sync.RWMutex`
-- [x] Persistência em disco com Append-Only File (AOF) e `Replay` no boot
-- [x] Expiração de chaves (`SETEX`) com limpeza passiva e ativa em background
-- [x] Graceful Shutdown interceptando `SIGINT` e `SIGTERM`
-- [x] Refatoração com interfaces (`KeyValueStore` e `AppendLogger`) e flags CLI (`-addr`, `-aof`)
-- [x] Testes unitários e de integração com `-race` (`db_test.go`, `aof_test.go`, `tcp_test.go`)
-- [x] Script inicial de benchmark concorrente (`cmd/bench/main.go`)
-- [ ] Compactação do AOF (`BGREWRITEAOF`) com escrita em arquivo temporário e troca atômica (`os.Rename`)
-- [ ] Mensageria em tempo real (`SUBSCRIBE` / `PUBLISH`) usando Go Channels
-- [ ] Evoluir o benchmark para calcular latência média, P95 e P99 e registrar os resultados neste README
-- [ ] Adicionar `Makefile` na raiz para padronizar `build`, `run`, `test` e `bench`
+```text
+# Terminal A (Subscriber)
+$ nc localhost 6379
+SUBSCRIBE alerts
+SUBSCRIBED alerts
+MESSAGE alerts deploy finished successfully
+UNSUBSCRIBE alerts
+UNSUBSCRIBED alerts
+```
 
-## Autor
+```text
+# Terminal B (Publisher)
+$ nc localhost 6379
+PUBLISH alerts deploy finished successfully
+1
+```
+
+## Roadmap & Milestones
+
+- [x] Custom raw TCP server using Go's `net` package (goroutine per connection)
+- [x] Thread-safe in-memory Key-Value engine with `sync.RWMutex`
+- [x] Append-Only File (AOF) disk persistence with startup `Replay`
+- [x] Key expiration (`SETEX`) with passive checks and active background eviction
+- [x] Graceful Shutdown handling `SIGINT` and `SIGTERM`
+- [x] Consumer-side interface decoupling (`KeyValueStore`, `AppendLogger`, `PubSubBroker`) and CLI flags
+- [x] Unit & integration test suite with `-race` (`db_test.go`, `aof_test.go`, `broker_test.go`, `tcp_test.go`)
+- [x] Atomic AOF compaction (`BGREWRITEAOF`) via temporary file + `Sync()` + `os.Rename`
+- [x] Real-time Pub/Sub broker (`SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`) using Go channels
+- [x] Worker-pool load benchmark with throughput and `P50` / `P95` / `P99` latency metrics
+- [x] `Makefile` automation and multi-stage Docker setup with persistent volume
+
+## Author
 
 Augusto Ortigoso Barbosa
 
