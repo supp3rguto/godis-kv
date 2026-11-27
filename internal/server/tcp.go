@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 )
 
-//  defines the in-memory storage contract consumed by the server
+// defines the in-memory storage contract consumed by the server.
 type KeyValueStore interface {
 	Set(key, value string, ttlSeconds int)
 	Get(key string) (string, bool)
@@ -20,13 +20,13 @@ type KeyValueStore interface {
 	SnapshotCommands() []string
 }
 
-//  defines the disk persistence contract
+// . defines the disk persistence contract.
 type AppendLogger interface {
 	Append(command string) error
 	Rewrite(snapshotFn func() []string) error
 }
 
-// defines the real-time messaging contract
+//defines the real-time messaging contract.
 type PubSubBroker interface {
 	Subscribe(channel string) (<-chan string, func())
 	Publish(channel, message string) int
@@ -37,6 +37,7 @@ type Server struct {
 	db        KeyValueStore
 	aof       AppendLogger
 	pubsub    PubSubBroker
+	mu        sync.Mutex
 	listener  net.Listener
 	rewriting atomic.Bool
 }
@@ -51,16 +52,19 @@ func NewServer(addr string, db KeyValueStore, aof AppendLogger, pubsub PubSubBro
 }
 
 func (s *Server) Start() error {
-	var err error
-	s.listener, err = net.Listen("tcp", s.addr)
+	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return err
 	}
 
+	s.mu.Lock()
+	s.listener = ln
+	s.mu.Unlock()
+
 	fmt.Printf("TCP server listening on %s\n", s.addr)
 
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				break
@@ -74,8 +78,12 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() {
-	if s.listener != nil {
-		s.listener.Close()
+	s.mu.Lock()
+	ln := s.listener
+	s.mu.Unlock()
+
+	if ln != nil {
+		ln.Close()
 	}
 }
 

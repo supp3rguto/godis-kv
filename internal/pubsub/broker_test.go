@@ -11,7 +11,7 @@ func TestBroker_PublishSubscribeAndUnsubscribe(t *testing.T) {
 	broker := NewBroker()
 
 	if count := broker.Publish("alertas", "ninguem"); count != 0 {
-		t.Fatalf("esperava 0 entregas, recebeu %d", count)
+		t.Fatalf("want 0 deliveries, got %d", count)
 	}
 
 	ch1, unsub1 := broker.Subscribe("alertas")
@@ -19,39 +19,38 @@ func TestBroker_PublishSubscribeAndUnsubscribe(t *testing.T) {
 	defer unsub2()
 
 	if count := broker.Publish("alertas", "cpu_alta"); count != 2 {
-		t.Fatalf("esperava 2 entregas, recebeu %d", count)
+		t.Fatalf("want 2 deliveries, got %d", count)
 	}
 
 	for i, ch := range []<-chan string{ch1, ch2} {
 		select {
 		case msg := <-ch:
 			if msg != "cpu_alta" {
-				t.Errorf("assinante %d: esperava 'cpu_alta', recebeu %q", i+1, msg)
+				t.Errorf("subscriber %d: want 'cpu_alta', got %q", i+1, msg)
 			}
 		case <-time.After(time.Second):
-			t.Fatalf("timeout aguardando mensagem no assinante %d", i+1)
+			t.Fatalf("timeout waiting for message on subscriber %d", i+1)
 		}
 	}
 
-	// valida idempotencia do unsubscribe
 	unsub1()
 	unsub1()
 
 	if _, open := <-ch1; open {
-		t.Fatal("channel do assinante 1 deveria estar fechado apos unsubscribe")
+		t.Fatal("subscriber 1 channel should be closed after unsubscribe")
 	}
 
 	if count := broker.Publish("alertas", "disco_cheio"); count != 1 {
-		t.Fatalf("esperava 1 entrega apos unsubscribe, recebeu %d", count)
+		t.Fatalf("want 1 delivery after unsubscribe, got %d", count)
 	}
 
 	select {
 	case msg := <-ch2:
 		if msg != "disco_cheio" {
-			t.Errorf("assinante 2: esperava 'disco_cheio', recebeu %q", msg)
+			t.Errorf("subscriber 2: want 'disco_cheio', got %q", msg)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timeout aguardando segunda mensagem no assinante 2")
+		t.Fatal("timeout waiting for second message on subscriber 2")
 	}
 }
 
@@ -62,12 +61,12 @@ func TestBroker_NonBlockingOnSlowSubscriber(t *testing.T) {
 
 	for i := 0; i < defaultBufferSize; i++ {
 		if count := broker.Publish("stream", fmt.Sprintf("msg-%d", i)); count != 1 {
-			t.Fatalf("esperava entrega %d bem-sucedida, recebeu %d", i, count)
+			t.Fatalf("expected delivery %d to succeed, got %d", i, count)
 		}
 	}
 
 	if count := broker.Publish("stream", "overflow"); count != 0 {
-		t.Fatalf("esperava 0 com buffer cheio, recebeu %d", count)
+		t.Fatalf("expected 0 deliveries when buffer is full, got %d", count)
 	}
 }
 
@@ -95,4 +94,36 @@ func TestBroker_Concurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func BenchmarkBroker_Publish(b *testing.B) {
+	for _, subs := range []int{0, 1, 10} {
+		b.Run(fmt.Sprintf("subscribers=%d", subs), func(b *testing.B) {
+			broker := NewBroker()
+			var wg sync.WaitGroup
+			unsubs := make([]func(), 0, subs)
+
+			for i := 0; i < subs; i++ {
+				ch, unsub := broker.Subscribe("bench")
+				unsubs = append(unsubs, unsub)
+				wg.Add(1)
+				go func(c <-chan string) {
+					defer wg.Done()
+					for range c {
+					}
+				}(ch)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				broker.Publish("bench", "benchmark_event_payload")
+			}
+			b.StopTimer()
+
+			for _, unsub := range unsubs {
+				unsub()
+			}
+			wg.Wait()
+		})
+	}
 }
